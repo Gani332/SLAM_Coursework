@@ -44,8 +44,9 @@ classdef LandmarkRangeBearingEdge < g2o.core.BaseBinaryEdge
             % Outputs:
             %   obj - (handle)
             %       An instance of a LandmarkRangeBearingEdge.
-
+            
             obj = obj@g2o.core.BaseBinaryEdge(2);
+
         end
         
         function initialEstimate(obj)
@@ -58,10 +59,18 @@ classdef LandmarkRangeBearingEdge < g2o.core.BaseBinaryEdge
             %   Compute the initial estimate of the landmark given the
             %   platform pose and observation.
 
-            warning('LandmarkRangeBearingEdge.initialEstimate: implement')
+            pose = obj.edgeVertices{1}.estimate();
+            x = pose(1);
+            y = pose(2);
+            theta = pose(3);
 
-            lx = obj.edgeVertices{1}.x(1:2);
-            obj.edgeVertices{2}.setEstimate(lx);
+            r = obj.z(1);
+            beta = obj.z(2);
+
+            alpha = theta+beta;
+            l = [x+r*cos(alpha); y+r*sin(alpha)];
+
+            obj.edgeVertices{2}.setEstimate(l);
         end
         
         function computeError(obj)
@@ -73,10 +82,24 @@ classdef LandmarkRangeBearingEdge < g2o.core.BaseBinaryEdge
             % Description:
             %   Compute the value of the error, which is the difference
             %   between the predicted and actual range-bearing measurement.
-
-            warning('LandmarkRangeBearingEdge.computeError: implement')
            
             obj.errorZ = zeros(2, 1);
+            pose = obj.edgeVertices{1}.estimate();
+            x = pose(1);
+            y = pose(2);
+            theta = pose(3);
+            
+            l = obj.edgeVertices{2}.estimate();
+            lx = l(1);
+            ly = l(2);
+
+            dy = ly-y;
+            dx = lx-x;
+            r = sqrt(dy.^2+dx.^2);
+            beta = atan2(dy,dx)-theta;
+            
+            obj.errorZ(1) = obj.z(1)-r;
+            obj.errorZ(2) = g2o.stuff.normalize_theta(obj.z(2)-beta);
         end
         
         function linearizeOplus(obj)
@@ -90,11 +113,35 @@ classdef LandmarkRangeBearingEdge < g2o.core.BaseBinaryEdge
             %   the vertex.
             %
 
-            warning('LandmarkRangeBearingEdge.linearizeOplus: implement')
-
             obj.J{1} = eye(2, 3);
             
             obj.J{2} = eye(2);
+
+            pose = obj.edgeVertices{1}.estimate();
+            x = pose(1);
+            y = pose(2);
+            theta = pose(3);
+
+            l = obj.edgeVertices{2}.estimate();
+            lx = l(1);
+            ly = l(2);
+            
+            dx = lx-x;
+            dy = ly-y;
+
+            q = dx*dx + dy*dy;
+            r = sqrt(q);
+
+            %lets be safe incase pose==landmark
+            eps=1e-12;
+            if q<eps
+                q=eps;
+                r=sqrt(q);
+            end
+
+            obj.J{1} = [dx/r, dy/r, 0; -dy/q, dx/q, 1];
+
+            obj.J{2} = [-dx/r, -dy/r; dy/q, -dx/q];
         end        
     end
 end
