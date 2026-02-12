@@ -4,6 +4,9 @@ import ebe.core.*;
 import ebe.graphics.*;
 import cw1.*;
 
+% Locate figs output directory
+figsDir = findFigsDir();
+
 % Find, load and parse the configuration file
 config = ebe.utils.readJSONFile('config/q3_a.json');
 
@@ -58,6 +61,11 @@ mainLoop.setGraphicsUpdatePeriod(25);
 % Run the main loop until it terminates
 mainLoop.run();
 
+% Save map snapshot for report
+FigureManager.getFigure("Q2c");
+drawnow
+saveas(gcf, fullfile(figsDir, 'q3_a_map.png'));
+
 % Plot out state information
 
 stateLabels = {'$x$','$y$', '$\theta$'};
@@ -100,3 +108,15 @@ end
 
 % Timing results
 cw1.q3_a_show_results
+
+function figsDir = findFigsDir()
+    figsDir = pwd;
+    while ~exist(fullfile(figsDir, 'figs'), 'dir')
+        parent = fileparts(figsDir);
+        if strcmp(parent, figsDir)
+            break
+        end
+        figsDir = parent;
+    end
+    figsDir = fullfile(figsDir, 'figs');
+end

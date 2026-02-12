@@ -1,0 +1,9 @@
+chosen_range=6
+g2o_frac=0.6061
+ekf_frac=0.6970
+delta=0.0909
+
+All results:
+range=4 g2o=0.4747 ekf=0.4747 delta=0.0000
+range=6 g2o=0.6061 ekf=0.6970 delta=0.0909
+range=8 g2o=0.9091 ekf=0.3333 delta=0.5758

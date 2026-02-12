@@ -4,6 +4,9 @@ import ebe.core.*;
 import ebe.graphics.*;
 import cw1.*;
 
+% Locate figs output directory
+figsDir = findFigsDir();
+
 % Find, load and parse the configuration file
 config = ebe.utils.readJSONFile('config/q1_b.json');
 
@@ -78,4 +81,37 @@ for e = 1 : numel(resultsAccumulator.xEstStore)
         ylabel('Position $(ms)$', 'Interpreter','latex')
         title(stateLabels{f}, 'Interpreter','latex')
     end
+end
+
+% Plot heading consistency (theta) and save
+ebe.graphics.FigureManager.getFigure('Q1b Heading');
+clf
+hold on
+PX = resultsAccumulator.PEstStore{1};
+X = resultsAccumulator.xEstStore{1};
+sigmaBound = 2 * sqrt(max(PX(3, :), 0));
+plot(TEstimator, -sigmaBound, 'r--', 'LineWidth', 2)
+plot(TEstimator, sigmaBound, 'r--', 'LineWidth', 2)
+thetaError = X(3, :) - XTrueHistory(3, :);
+thetaError = atan2(sin(thetaError), cos(thetaError));
+plot(TEstimator, thetaError, 'LineWidth', 2);
+maxError = max(abs(thetaError)) + 0.01;
+bound = 1.1 * max(maxError, max(sigmaBound));
+axis([TEstimator(1) TEstimator(end) -bound bound])
+xlabel('Time (s)')
+ylabel('Angle (rad)', 'Interpreter','latex')
+title('$\\theta$', 'Interpreter','latex')
+drawnow
+saveas(gcf, fullfile(figsDir, 'q1_b_heading.png'));
+
+function figsDir = findFigsDir()
+    figsDir = pwd;
+    while ~exist(fullfile(figsDir, 'figs'), 'dir')
+        parent = fileparts(figsDir);
+        if strcmp(parent, figsDir)
+            break
+        end
+        figsDir = parent;
+    end
+    figsDir = fullfile(figsDir, 'figs');
 end

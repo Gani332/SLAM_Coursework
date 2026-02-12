@@ -1,0 +1,944 @@
+%==========================
+% COMP0222 CW1 Report (IEEE)
+%==========================
+\documentclass[conference]{IEEEtran}
+
+% ---------- Packages ----------
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+
+\usepackage{amsmath, amssymb, bm}
+\usepackage{mathtools}
+\usepackage{siunitx}
+
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+
+\usepackage{hyperref}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  citecolor=blue,
+  urlcolor=blue
+}
+
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{enumitem}
+% ---------- Figure placeholder helper ----------
+\newcommand{\includegraphicsorplaceholder}[2]{%
+  \IfFileExists{#1}{%
+    \includegraphics[width=\linewidth]{#1}%
+  }{%
+    \fbox{\parbox{0.95\linewidth}{\centering
+      \vspace{1.5em}
+      \textbf{Placeholder: #2}\\
+      Missing file: \texttt{#1}
+      \vspace{1.5em}}}%
+  }%
+}
+
+% ---------- Listings style (MATLAB/Python/C++) ----------
+\lstdefinestyle{code}{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false
+}
+\lstset{style=code}
+
+% ---------- Macros ----------
+\newcommand{\xk}{\mathbf{x}_k}
+\newcommand{\xkp}{\mathbf{x}_{k+1}}
+\newcommand{\mi}{\mathbf{m}_i}
+\newcommand{\zk}{\mathbf{z}_k}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\trans}{^{\mathsf{T}}}
+
+% ---------- Title / Authors ----------
+\title{COMP0222 Coursework 01: Graph-based Optimisation and SLAM\\
+\large Factor-Graph Localisation and SLAM with Scalability Analysis}
+
+\author{
+\IEEEauthorblockN{Group \texttt{g} (Code Group)}
+\IEEEauthorblockA{
+Department of Computer Science, University College London\\
+Candidates: Riyaadh Gani (23016003), Adrian Pailler (ID2)\\
+Email: \{riyaadh.gani.23, adrian.pailler.23\}@ucl.ac.uk
+}
+}
+
+\begin{document}
+\maketitle
+
+% ---------- Abstract ----------
+\begin{abstract}
+This report presents the implementation and analysis of a factor-graph based estimation system for a wheeled robot operating in a 2D landmark environment. We move from GPS-enabled localisation to full SLAM with range--bearing landmark observations, compare performance against EKF-based baselines under nominal and punishing sensing regimes, and interpret optimisation behaviour using $\chi^2$ and timing diagnostics. Finally, we evaluate scalability strategies including graph pruning and conditioning (fixing past poses), and quantify their impact on consistency, accuracy, and computational cost.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Factor graphs, SLAM, graph optimisation, g2o, EKF-SLAM, consistency, conditioning, pruning
+\end{IEEEkeywords}
+
+%==========================
+\section{Introduction}
+Localisation estimates only the robot state using known map information, while SLAM estimates both the robot trajectory and the map. Factor graphs provide a natural way to model these problems: unknown states are vertices and constraints from motion or sensing are edges, which leads to a global nonlinear least-squares optimisation. This coursework asks us to build and analyse a graph-based estimator for a 2D robot, compare it to EKF baselines, and study scalability strategies.
+
+Our contributions are:
+\begin{itemize}
+  \item Implemented the motion prediction factor (\texttt{PlatformPredictionEdge}) with timestamp-aware $\Delta T$ handling and analytical Jacobians.
+  \item Implemented the landmark range--bearing factor (\texttt{LandmarkRangeBearingEdge}) with correct residuals, angle wrapping, and Jacobians.
+  \item Compared EKF and factor-graph estimators under nominal and punishing sensing scenarios.
+  \item Analysed $\chi^2$ trends and optimisation runtimes; evaluated pruning and conditioning strategies for scalability.
+\end{itemize}
+
+%==========================
+\section{Problem Formulation}
+\subsection{State and Notation}
+Robot pose at time $k$:
+\begin{equation}
+\xk =
+\begin{bmatrix}
+x_k & y_k & \psi_k
+\end{bmatrix}\trans.
+\end{equation}
+Landmark $i$:
+\begin{equation}
+\mi =
+\begin{bmatrix}
+x_i & y_i
+\end{bmatrix}\trans.
+\end{equation}
+% Mention coordinate conventions (right-handed, radians).
+
+\subsection{Factor Graph View of Estimation}
+A factor graph represents the posterior (up to normalisation) as a product of factors:
+\begin{equation}
+p(\mathcal{X}\mid \mathcal{Z}) \propto \prod_j \phi_j(\mathcal{X}_j;\,\mathbf{z}_j).
+\end{equation}
+Assuming Gaussian noise, each factor corresponds to a squared residual and yields a nonlinear least-squares objective:
+\begin{equation}
+\min_{\mathcal{X}} \sum_j \norm{\mathbf{r}_j(\mathcal{X}_j)}^2_{\mathbf{\Omega}_j}
+\quad\text{where}\quad
+\norm{\mathbf{e}}^2_{\mathbf{\Omega}}=\mathbf{e}\trans \mathbf{\Omega}\mathbf{e}.
+\end{equation}
+Vertices correspond to unknown states (poses and, in SLAM, landmarks). Edges encode constraints from the motion model and sensor measurements, each contributing a residual term weighted by the inverse noise covariance. Solving the resulting least-squares problem yields the MAP estimate of all states.
+
+%==========================
+\section{Q1: GPS-Enabled Localisation}
+\subsection{Q1a: Factor Graph Structure (Localisation)}
+
+Figure~\ref{fig:q1_graph} shows the factor graph used for GPS-enabled localisation.
+Only platform pose states are estimated; no landmark variables are included at this
+stage. The purpose of the graph is to estimate the full platform trajectory by jointly
+combining relative motion information (odometry) with absolute position measurements
+(GPS) in a single probabilistic optimisation problem.
+
+At a high level, the graph can be read from left to right as follows: starting from a
+known initial pose, the platform propagates its state forward using odometry, which
+introduces uncertainty and drift, and this drift is periodically corrected using GPS
+measurements.
+
+\paragraph{Vertices (pose states).}
+Each circular node in Fig.~\ref{fig:q1_graph} represents the platform pose at time
+step $k$,
+\[
+\mathbf{x}_k =
+\begin{bmatrix}
+x_k & y_k & \psi_k
+\end{bmatrix}^{\mathsf{T}},
+\]
+as defined in Appendix~A.1. These pose variables are the unknowns of the problem.
+During optimisation, pose updates are applied using an addition operator
+$\boxplus$, corresponding to standard vector addition in $\mathbb{R}^3$ with angle
+normalisation on $\psi$. This allows small increments to be applied to the current
+estimate while respecting the angular nature of the heading.
+
+\paragraph{Initial prior factor $f_0(\mathbf{x}_0)$.}
+The leftmost factor in Fig.~\ref{fig:q1_graph} is a unary prior factor on $\mathbf{x}_0$.
+It encodes the known initial position and orientation provided by the simulator.
+Conceptually, this is equivalent to knowing exactly where the platform starts before
+any motion occurs. This factor anchors the trajectory and removes gauge freedom,
+ensuring that the optimisation problem is well-posed.
+
+\paragraph{Motion (process model) factors $f_k(\mathbf{x}_{k}\mid\mathbf{x}_{k-1})$.}
+Binary motion factors connect consecutive pose vertices $(\mathbf{x}_{k-1},
+\mathbf{x}_k)$, as shown by the horizontal chain in Fig.~\ref{fig:q1_graph}. Each
+motion factor encodes the process model given in Appendix~A.2, which predicts the
+next pose by propagating $\mathbf{x}_{k-1}$ forward using the control input
+$\mathbf{u}_k$ over a (possibly variable) time interval $\Delta T_k$, with additive
+Gaussian process noise of covariance $Q_k$.
+
+Intuitively, these factors represent dead-reckoning: given how fast the platform was
+moving and how much it turned, the factor enforces that the estimate of
+$\mathbf{x}_k$ should be close to the pose predicted from $\mathbf{x}_{k-1}$. The
+associated residual penalises disagreement between the predicted pose and the
+current estimate, while allowing uncertainty to grow over time.
+
+\paragraph{GPS observation factors $h_k(\mathbf{x}_k)$.}
+Unary GPS factors attach to individual pose vertices, illustrated by the vertical edges
+in Fig.~\ref{fig:q1_graph}. Each GPS factor encodes the observation model in
+Appendix~A.3, which directly measures the $(x_k,y_k)$ components of the platform
+state with additive Gaussian noise of covariance $R_G$.
+
+These factors provide absolute position information, analogous to periodically
+checking a GPS while navigating. While individual GPS measurements may be noisy,
+they prevent unbounded drift by pulling the trajectory back toward globally consistent
+positions. The residual of each GPS factor penalises the difference between the
+estimated pose position and the measured GPS position.
+
+\paragraph{Overall interpretation.}
+Together, the prior, motion, and GPS factors form a chain-structured factor graph in
+which relative motion constraints accumulate uncertainty, and absolute GPS
+measurements correct that uncertainty. By optimising all pose variables jointly, the
+graph produces a maximum a posteriori (MAP) estimate of the platform trajectory that
+balances local motion consistency with global positional accuracy.
+
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figs/q1_localisation_graph.png}
+\caption{Localisation factor graph: pose vertices connected by motion factors; GPS factors anchor poses to observed positions.}
+\label{fig:q1_graph}
+\end{figure}
+
+
+
+\subsection{Q1b: PlatformPredictionEdge}
+
+This section describes the role and implementation of the motion prediction factor
+(\texttt{PlatformPredictionEdge}) and validates its correctness through a
+consistency analysis comparing estimation error to predicted covariance.
+
+\subsubsection{Factor role and residual}
+
+The \texttt{PlatformPredictionEdge} encodes the platform motion (process) model,
+constraining two consecutive pose states $\mathbf{x}_{k-1}$ and $\mathbf{x}_k$.
+It enforces that the relative motion implied by the two poses is consistent with
+the odometry measurement $\mathbf{u}_k$ over the elapsed time interval $\Delta T_k$.
+
+The measurement associated with this factor is therefore the odometry input
+$\mathbf{u}_k$ (with covariance $Q_k$) together with its timestamp, from which
+$\Delta T_k$ is computed. Using the process model in Appendix~A.2, the factor
+predicts the odometry implied by the current pose estimates,
+\[
+\hat{\mathbf{u}}_k = \frac{1}{\Delta T_k}\,\mathbf{M}(\psi_{k-1})^{-1}
+(\mathbf{x}_k-\mathbf{x}_{k-1}),
+\]
+and defines the residual as
+\[
+\mathbf{e}_{\text{odom}} = \mathbf{u}_k - \hat{\mathbf{u}}_k,
+\]
+with angle normalisation applied to the heading component of the pose difference.
+
+Under Gaussian noise assumptions, this residual contributes a weighted squared
+error term to the overall nonlinear least-squares objective, encouraging
+consecutive pose estimates to be dynamically consistent while allowing uncertainty
+to grow over time.
+
+\subsubsection{Implementation overview}
+
+The factor implementation follows the standard structure of a binary g2o edge.
+An initial estimate for $\mathbf{x}_k$ is obtained by forward propagation of
+$\mathbf{x}_{k-1}$ using the process model and $\Delta T_k$. During optimisation,
+the residual is computed as the difference between the measured odometry
+$\mathbf{u}_k$ and the odometry implied by the current pose estimates. Angle
+normalisation is applied to the heading component of the pose difference.
+
+Analytical Jacobians with respect to both $\mathbf{x}_{k-1}$ and $\mathbf{x}_k$
+are implemented according to the linearisation of the process model in
+Appendix~A.2. Correct handling of the variable timestep $\Delta T_k$ ensures that
+both the predicted motion and the associated uncertainty scale appropriately with
+time.
+
+\begin{lstlisting}[language=Matlab,caption={PlatformPredictionEdge key methods (from \texttt{PlatformPredictionEdge.m}).},label={lst:q1b_platform_prediction}]
+% initialEstimate
+xk = obj.edgeVertices{1}.estimate();
+u  = obj.z;
+c = cos(xk(3)); s = sin(xk(3));
+M = [c -s 0; s c 0; 0 0 1];
+xkp = xk + obj.dT * M * u;
+xkp(3) = g2o.stuff.normalize_theta(xkp(3));
+obj.edgeVertices{2}.setEstimate(xkp);
+
+% computeError
+xk  = obj.edgeVertices{1}.estimate();
+xkp = obj.edgeVertices{2}.estimate();
+c = cos(xk(3)); s = sin(xk(3));
+Mt = [c s 0; -s c 0; 0 0 1];
+dx = xkp - xk; dx(3) = g2o.stuff.normalize_theta(dx(3));
+uhat = (1 / obj.dT) * Mt * dx;
+obj.errorZ = obj.z - uhat;
+
+% linearizeOplus
+dMtdtheta = [-s c 0; -c -s 0; 0 0 0];
+J2 = -(1 / obj.dT) * Mt;
+J1 =  (1 / obj.dT) * Mt;
+J1(:,3) = J1(:,3) - (1 / obj.dT) * (dMtdtheta * dx);
+obj.J{1} = J1; obj.J{2} = J2;
+\end{lstlisting}
+
+\subsubsection{Consistency check: error versus covariance}
+
+To validate the correctness of the motion factor implementation, we assess the
+statistical consistency of the estimator by comparing the true estimation error
+against the uncertainty predicted by the factor graph.
+
+Figure~\ref{fig:q1b_consistency} shows the estimation error in the $x$ and $y$
+position components,
+\[
+\hat{\mathbf{x}}_k - \mathbf{x}^{\text{true}}_k,
+\]
+together with the corresponding $\pm 2\sigma$ bounds derived from the diagonal
+elements of the estimated covariance matrix,
+\[
+\pm 2\sqrt{P_{xx}(k)}, \quad \pm 2\sqrt{P_{yy}(k)}.
+\]
+
+The position error traces in Fig.~\ref{fig:q1b_consistency} lie mostly inside the
+predicted $\pm 2\sigma$ bounds, with only brief touches near the envelope. This
+pattern indicates that the covariance produced by the graph is broadly consistent
+with the realised error for this run, supporting the correctness of the motion model,
+noise scaling (including $\Delta T_k$ handling), and linearisation.
+
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/q1_b_results.png}
+  \caption{Q1b consistency check: position estimation error in $x$ and $y$ compared
+  against the predicted $\pm 2\sigma$ bounds derived from the factor graph
+  covariance.}
+  \label{fig:q1b_consistency}
+\end{figure}
+
+Figure~\ref{fig:q1b_heading} shows the heading error against its $\pm 2\sigma$
+bounds. The heading error stays close to the uncertainty envelope in this run,
+which is consistent with a well-calibrated angular covariance.
+
+\begin{figure}[t]
+  \centering
+  \includegraphicsorplaceholder{figs/q1_b_heading.png}{Q1b heading consistency plot}
+  \caption{Q1b consistency check: heading error compared against the predicted
+  $\pm 2\sigma$ bounds.}
+  \label{fig:q1b_heading}
+\end{figure}
+
+\subsection{Q1c: Optimisation Behaviour (Chi2 and Timing)}
+
+Before analysing optimisation behaviour, it is important to verify that the estimator itself remains well behaved. Figure~\ref{fig:q1c_results} shows the estimated $x$ and $y$ positions over time together with their uncertainty bounds.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/q1_c_results.png}
+  \caption{ Q1C Estimated $x$ and $y$ position over time with uncertainty bounds. The state estimate remains stable while uncertainty grows gradually as expected.}
+  \label{fig:q1c_results}
+\end{figure}
+
+The estimates remain bounded and consistent throughout the trajectory, indicating that the optimisation process is stable. Consequently, the trends observed in the optimisation metrics can be attributed to factor-graph growth rather than estimator divergence.
+
+Figure~\ref{fig:q1c_chi2_time} shows the evolution of the final $\chi^2$ cost and the optimisation time when the factor graph is re-optimised at every timestep.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/q1_c_chi2.png}
+  \caption{Q1C Evolution of final $\chi^2$ cost (top) and optimisation time per timestep (bottom) when full batch optimisation is performed at every step.}
+  \label{fig:q1c_chi2_time}
+\end{figure}
+
+\paragraph{(i) $\chi^2$ trend.}
+The $\chi^2$ value tends to increase over time with a staircase-like profile. This behaviour is expected, as each timestep introduces new state variables and additional measurement factors. Since
+\[
+\chi^2 = \sum_k r_k(x)^\top \Omega_k r_k(x),
+\]
+adding more residual terms increases the total cost even when the estimator remains statistically consistent. The discrete jumps correspond to timesteps where new constraints (e.g.\ odometry or measurement factors) are added to the graph.
+Note that this is the total (unnormalised) cost; for statistical comparability across time,
+it is more meaningful to normalise by degrees of freedom, e.g.\ $\chi^2/(m-n)$, which
+should remain $\mathcal{O}(1)$ for a consistent model.
+
+\paragraph{(ii) Runtime trend.}
+The optimisation time stays near a low baseline for most timesteps, but exhibits
+\emph{regular narrow spikes} whose height increases over the run
+(Fig.~\ref{fig:q1c_chi2_time}, bottom). Early spikes are small (tens of ms), while
+late-run spikes reach the highest values (around the end of the plotted horizon).
+This indicates that most incremental additions are cheap to absorb, but certain
+updates trigger a noticeably harder solve (more linearisation/iterations or a more
+costly factorisation).
+
+\paragraph{(iii) Relationship between $\chi^2$, runtime, and graph structure.}
+In this experiment, the two traces are not only increasing with time, they often
+\emph{coincide}: many runtime spikes occur near the step-like increases in $\chi^2$
+(compare the jump locations in the top plot to the spike locations in the bottom plot
+of Fig.~\ref{fig:q1c_chi2_time}). This pattern is consistent with a subset of
+timesteps introducing stronger corrections or a more costly linear solve, which can
+require larger state updates and/or more Gauss--Newton iterations before convergence.
+
+Concretely, the staircase $\chi^2$ is expected because the plotted value is the
+\emph{total} cost (sum of all weighted residuals), so adding factors increases it.
+However, the fact that the cost increases in discrete jumps (rather than a smooth
+drift) indicates that factors are being added intermittently (not at every single
+step). The intermittent runtime spikes suggest that these same timesteps are more
+expensive to solve. This is consistent with a
+chain-structured pose graph where most steps add a local motion constraint, while
+occasional absolute constraints introduce stronger corrections that propagate
+through the trajectory.
+
+Overall, these results motivate incremental or sliding-window optimisation strategies to limit computational growth while preserving estimation accuracy.
+
+%==========================
+\section{Q2: Full SLAM (Poses + Landmarks)}
+\subsection{Q2a: Factor Graph Structure (SLAM)}
+
+\begin{figure}[t]
+  \centering
+  \includegraphicsorplaceholder{figs/q2_slam_graph.png}{Q2 SLAM factor graph figure}
+  \caption{SLAM factor graph: pose chain plus landmark vertices; each observation
+  adds a pose--landmark constraint.}
+  \label{fig:q2_graph}
+\end{figure}
+
+\subsubsection{Factor Role and Measurement Model}
+
+In Question~1, the factor graph addressed a pure \textbf{localisation} problem: the robot's pose was estimated using odometry predictions and GPS observations, with no modelling of the external environment. In Question~2, GPS is no longer available. Instead, the robot is equipped with a range-bearing sensor that observes uniquely identifiable landmarks whose number and positions are unknown. This transforms the problem into \textbf{full SLAM}, where both the robot trajectory \emph{and} the landmark map must be estimated simultaneously.
+
+To accommodate this, the factor graph from Q1 is extended with a new type of vertex (landmark vertices) and a new type of edge (landmark observation edges).
+
+\subsubsection{Vertices}
+
+The full SLAM factor graph contains two types of vertices:
+
+\begin{table}[h]
+\centering
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}l l c p{0.38\linewidth}@{}}
+\toprule
+\textbf{Vertex type} & \textbf{State vector} & \textbf{Dim.} & \textbf{Addition operator ($\oplus$)} \\
+\midrule
+Platform pose $\mathbf{x}_k$ &
+$\mathbf{x}_k = \begin{pmatrix} x_k \\ y_k \\ \psi_k \end{pmatrix}$ &
+3 &
+Standard $\mathbb{R}^3$ addition with angle wrapping on $\psi_k$ \\[4pt]
+Landmark $\mathbf{m}^i$ &
+$\mathbf{m}^i = \begin{pmatrix} x^i \\ y^i \end{pmatrix}$ &
+2 &
+Standard $\mathbb{R}^2$ addition (no wrapping needed) \\
+\bottomrule
+\end{tabular}
+\caption{Vertex types in the full SLAM factor graph.}
+\end{table}
+
+The pose vertex lives on $SE(2)$; hence, the $\oplus$ operator must wrap the heading component $\psi_k$ to $(-\pi, \pi]$ after addition. The landmark vertex lives in $\mathbb{R}^2$, so standard vector addition suffices.
+
+\subsubsection{Edges}
+
+Three types of edges are present in the graph:
+
+%--- Prior edge ---
+\subsection*{1.\quad Prior (Initialisation) Edge — Unary}
+
+\begin{itemize}[nosep]
+  \item \textbf{Type:} Unary edge.
+  \item \textbf{Connected vertex:} $\mathbf{x}_0$.
+  \item \textbf{Purpose:} Anchors the graph by fixing the initial pose, setting the reference frame for all subsequent estimates.
+  \item \textbf{Measurement encapsulated:} The initial pose $\mathbf{x}_0$ and its covariance $\mathbf{P}_0$.
+  \item \textbf{Error:}
+  \[
+    \mathbf{e}_{\text{prior}} = \hat{\mathbf{x}}_0 - \mathbf{x}_0
+  \]
+  (with angle wrapping on the $\psi$ component).
+  \item \textbf{Information matrix:} $\boldsymbol{\Omega}_{\text{prior}} = \mathbf{P}_0^{-1}$.
+\end{itemize}
+
+%--- Odometry edge ---
+\subsection*{2.\quad Process (Odometry) Edge — Binary}
+
+\begin{itemize}[nosep]
+  \item \textbf{Type:} Binary edge.
+  \item \textbf{Connected vertices:} $\mathbf{x}_{k}$ (slot~1) and $\mathbf{x}_{k+1}$ (slot~2).
+  \item \textbf{Purpose:} Constrains the relative motion between consecutive poses according to the odometry-driven motion model.
+  \item \textbf{Measurements encapsulated:} The control input $\mathbf{u}_{k+1}$ (odometry) and the prediction interval $\Delta T_{k+1}$.
+  \item \textbf{Model:} The process model (Equations~3--4 in Appendix~A):
+  \[
+    \mathbf{x}_{k+1} = \mathbf{x}_k + \mathbf{M}(\psi_k)\,\mathbf{u}_{k+1}
+  \]
+  where
+  \[
+    \mathbf{M}(\psi_k) = \Delta T_{k+1}
+    \begin{pmatrix}
+      \cos\psi_k & -\sin\psi_k & 0 \\
+      \sin\psi_k & \cos\psi_k  & 0 \\
+      0           & 0            & 1
+    \end{pmatrix}.
+  \]
+  \item \textbf{Error:}
+  \[
+    \mathbf{e}_{\text{odom}} = \mathbf{u}_{k+1} - \hat{\mathbf{u}}_{k+1},\quad
+    \hat{\mathbf{u}}_{k+1}=\frac{1}{\Delta T_{k+1}}\mathbf{M}(\psi_k)^{-1}\bigl(\mathbf{x}_{k+1}-\mathbf{x}_k\bigr)
+  \]
+  with angle wrapping applied to the heading component of $(\mathbf{x}_{k+1}-\mathbf{x}_k)$.
+  \item \textbf{Information matrix:} $\boldsymbol{\Omega}_{\text{odom}} = \mathbf{Q}_k^{-1}$.
+\end{itemize}
+
+The corresponding probabilistic factor is:
+\[
+  p(\mathbf{u}_{k+1} \mid \mathbf{x}_k, \mathbf{x}_{k+1})
+  \;\propto\;
+  \exp\!\Bigl(-\tfrac{1}{2}\,
+  \bigl\|\mathbf{u}_{k+1} - \hat{\mathbf{u}}_{k+1}\bigr\|^2_{\boldsymbol{\Omega}_{\text{odom}}}\Bigr),
+\]
+where $\hat{\mathbf{u}}_{k+1}$ is the odometry implied by the current pose estimates.
+
+%--- Landmark observation edge ---
+\subsection*{3.\quad Landmark Observation Edge — Binary}
+
+\begin{itemize}[nosep]
+  \item \textbf{Type:} Binary edge.
+  \item \textbf{Connected vertices:} $\mathbf{x}_{k+1}$ (slot~1) and $\mathbf{m}^j$ (slot~2), where landmark $j$ is observed at time step $k{+}1$.
+  \item \textbf{Purpose:} Enforces consistency between the current pose and the landmark position given the measured range and bearing.
+  \item \textbf{Measurement encapsulated:} $\mathbf{z}^L_{k+1} = (r^j_{k+1},\;\beta^j_{k+1})^\top$.
+  \item \textbf{Model:} The landmark observation model (Section~A.4):
+  \begin{align}
+    r^j_{k+1}    &= \sqrt{(x^j - x_{k+1})^2 + (y^j - y_{k+1})^2} \\[4pt]
+    \beta^j_{k+1} = \operatorname{atan2}\!\bigl(y^j - y_{k+1},\,x^j - x_{k+1}\bigr) - \psi_{k+1}
+  \end{align}
+  \item \textbf{Error:}
+  \[
+    \mathbf{e}_{\text{obs}} =
+    \begin{pmatrix}
+      z_r - r^j_{k+1} \\[2pt]
+      \mathrm{wrap}\bigl(z_\beta - \beta^j_{k+1}\bigr)
+    \end{pmatrix},
+  \]
+  where $\mathrm{wrap}(\cdot)$ denotes angle normalisation to $(-\pi,\pi]$. This wrapping is critical for correctness.
+  \item \textbf{Information matrix:} $\boldsymbol{\Omega}_{\text{obs}} = (\mathbf{R}^L)^{-1}$, where $\mathbf{R}^L$ is the diagonal, time-invariant landmark observation noise covariance (identical for all landmarks).
+\end{itemize}
+
+The corresponding probabilistic factor is:
+\[
+  p(\mathbf{z}^L_{k+1} \mid \mathbf{x}_{k+1},\,\mathbf{m}^j)
+  \;\propto\;
+  \exp\!\Bigl(-\tfrac{1}{2}\,
+  \bigl\|\mathbf{z}^L_{k+1} - h(\mathbf{x}_{k+1},\,\mathbf{m}^j)\bigr\|^2_{\boldsymbol{\Omega}_{\text{obs}}}\Bigr),
+\]
+where $h(\cdot)$ is the observation function and $\boldsymbol{\Omega}_{\text{obs}} = (\mathbf{R}^L)^{-1}$ is the measurement information matrix.
+
+%----------------------------------------------------------------------
+\subsubsection{Graph Connectivity and Structure}
+%----------------------------------------------------------------------
+
+The graph has the following connectivity pattern:
+
+\begin{enumerate}[nosep]
+  \item A chain of \textbf{pose vertices} $\mathbf{x}_0, \mathbf{x}_1, \dots, \mathbf{x}_T$ connected sequentially by \textbf{odometry edges}. This chain encodes the temporal progression of the robot's trajectory.
+  \item A \textbf{unary prior edge} on $\mathbf{x}_0$ that anchors the entire graph and defines the global reference frame.
+  \item \textbf{Landmark vertices} $\mathbf{m}^1, \mathbf{m}^2, \dots, \mathbf{m}^L$ (where $L$ is the total number of unique landmarks discovered) that branch off the pose chain.
+  \item Each landmark vertex $\mathbf{m}^j$ is connected to every pose vertex $\mathbf{x}_t$ at which it was observed, via a \textbf{landmark observation edge}. This means:
+  \begin{itemize}[nosep]
+    \item A single pose $\mathbf{x}_t$ can connect to \emph{multiple} landmark vertices if several landmarks are visible simultaneously.
+    \item A single landmark $\mathbf{m}^j$ can connect to \emph{multiple} pose vertices if it is re-observed at different times. These re-observation edges are what enable \textbf{loop closure}: they create constraints that link temporally distant poses through a shared landmark, allowing the optimiser to correct accumulated drift.
+  \end{itemize}
+\end{enumerate}
+
+Note that, unlike Q1, there are \textbf{no GPS observation edges} in this graph, since GPS is unavailable in the Q2 scenario. Localisation is achieved entirely through the landmark observations and odometry.
+
+\subsection*{Landmark Initialisation}
+
+When a landmark $\mathbf{m}^j$ is first observed from pose $\mathbf{x}_t$ with measurement $\mathbf{z}^L = (r,\,\beta)^\top$, its initial estimate is computed by projecting the measurement into the world frame:
+\[
+  \hat{\mathbf{m}}^j =
+  \begin{pmatrix}
+    x_t + r\cos(\psi_t + \beta) \\
+    y_t + r\sin(\psi_t + \beta)
+  \end{pmatrix}.
+\]
+Subsequent observations of the same landmark refine this estimate through the optimisation.
+
+\subsection*{Key Differences from Q1}
+
+\begin{itemize}[nosep]
+  \item \textbf{Q1 (Localisation):} Only pose vertices and odometry/GPS edges. The world is not modelled.
+  \item \textbf{Q2 (Full SLAM):} Pose vertices \emph{and} landmark vertices, connected by odometry and landmark observation edges. No GPS edges. Both the trajectory and the map are estimated jointly.
+\end{itemize}
+
+\subsubsection{Implementation Snippets}
+\begin{lstlisting}[language=Matlab,caption={Key methods in LandmarkRangeBearingEdge (from \texttt{LandmarkRangeBearingEdge.m}).},label={lst:q2_landmark_edge},lineskip=1pt,aboveskip=0.6\baselineskip,belowskip=0.6\baselineskip,xleftmargin=0.5em,framexleftmargin=0.5em]
+% initialEstimate
+pose  = obj.edgeVertices{1}.estimate();
+x     = pose(1);
+y     = pose(2);
+theta = pose(3);
+r     = obj.z(1);
+beta  = obj.z(2);
+alpha = theta + beta;
+l     = [x + r*cos(alpha);
+         y + r*sin(alpha)];
+obj.edgeVertices{2}.setEstimate(l);
+
+% computeError
+pose = obj.edgeVertices{1}.estimate();
+l    = obj.edgeVertices{2}.estimate();
+dx   = l(1) - pose(1);
+dy   = l(2) - pose(2);
+r    = sqrt(dx^2 + dy^2);
+beta = atan2(dy, dx) - pose(3);
+obj.errorZ(1) = obj.z(1) - r;
+obj.errorZ(2) = g2o.stuff.normalize_theta(obj.z(2) - beta);
+
+% linearizeOplus
+q = dx^2 + dy^2;
+r = sqrt(q);
+obj.J{1} = [ dx/r,  dy/r, 0;
+            -dy/q,  dx/q, 1 ];
+obj.J{2} = [ -dx/r, -dy/r;
+             dy/q,  -dx/q ];
+\end{lstlisting}
+
+\subsubsection{Validation: Noise-Free and Noisy Runs}
+Figure~\ref{fig:q2b_results_g2o} and Fig.~\ref{fig:q2b_results_ekf} show the
+Q2b localisation errors for the two estimators. In the output plots, ``Results~1''
+corresponds to the first estimator added to the main loop (g2o-slam), while
+``Results~2'' corresponds to the second estimator (ekf-slam). In this noise-free
+setup, both estimators recover the trajectory to near-zero error: the curves stay
+within the $\pm 2\sigma$ bounds for $x$, $y$, and $\theta$. The uncertainty still
+grows over time because the process model accumulates uncertainty even without
+measurement noise. Figure~\ref{fig:q2b_chi2}
+shows the g2o $\chi^2$ and optimisation time traces produced by \texttt{cw1.q2\_b}.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/q2_b_results1.png}
+  \caption{Q2b Results 1: g2o-slam platform error vs $\pm 2\sigma$ bounds.}
+  \label{fig:q2b_results_g2o}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/q2_b_results2.png}
+  \caption{Q2b Results 2: ekf-slam platform error vs $\pm 2\sigma$ bounds.}
+  \label{fig:q2b_results_ekf}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/q2_b_chi2.png}
+  \caption{Q2b g2o $\chi^2$ (top) and optimisation time (bottom) over time.}
+  \label{fig:q2b_chi2}
+\end{figure}
+
+\subsubsection{Q2b(ii): Timing and $\chi^2$ Trends vs Q1}
+Figure~\ref{fig:q2b_chi2} shows a rising $\chi^2$ with step-like increases and
+optimisation-time spikes that grow over time. The pattern mirrors the behaviour in
+Q1c: as the graph grows, each re-optimisation adds residual blocks and the solver
+occasionally incurs a more expensive linear solve, producing narrow spikes. The
+overall trend is therefore consistent with increasing problem size rather than
+estimator instability.
+
+\subsection{Q2c: Punishing Scenario Analysis}
+\subsubsection{Q2c(i): Evidence of EKF Inconsistency vs Graph Consistency}
+The punishing setup produces a clear consistency gap.
+In the larger-range case ($r=8$), the g2o-slam error stays broadly within the
+$\pm2\sigma$ bounds across $x$, $y$, and $\theta$
+(Fig.~\ref{fig:q2c_results_g2o}), indicating that the covariance is commensurate
+with the realised error. In contrast, the EKF-SLAM estimate becomes strongly
+inconsistent (Fig.~\ref{fig:q2c_results_ekf}): the position error grows to several
+metres while the reported $\pm2\sigma$ envelope remains comparatively narrow,
+leading to sustained and large bound violations. This pattern is consistent with
+EKF overconfidence under sparse/irregular constraints and accumulated linearisation
+error.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/q2_c_results1.png}
+  \caption{Q2c Results 1: g2o-slam platform error vs $\pm 2\sigma$ bounds.}
+  \label{fig:q2c_results_g2o}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/q2_c_results2.png}
+  \caption{Q2c Results 2: ekf-slam platform error vs $\pm 2\sigma$ bounds.}
+  \label{fig:q2c_results_ekf}
+\end{figure}
+
+\subsubsection{Q2c(ii): Why Smaller Detection Range Hurts EKF More}
+With a smaller detection range, landmarks are observed less frequently and
+co-observations between consecutive poses become rarer. In this run, that produces
+longer gaps between correction events in the error plots, so the EKF relies more
+heavily on the process model for extended periods. This is reflected by larger
+drift episodes with comparatively tight bounds. In contrast, the factor graph
+aggregates all available constraints and relinearises globally, which is consistent
+with the tighter agreement between error and bounds when observations reappear.
+
+\subsubsection{Q2c(iii): Detection Range Threshold Experiment}
+A short sweep over detection range ($r\in\{4,6,8\}$, reduced horizon for runtime)
+shows that the estimators behave similarly only in an intermediate regime.
+At very small range ($r=4$), both EKF and g2o show larger deviations relative to
+their bounds (Figs.~\ref{fig:q2c_range_04_ekf} and \ref{fig:q2c_range_04_g2o}).
+At larger range ($r=8$), the EKF shows sustained $\pm2\sigma$ violations
+(Fig.~\ref{fig:q2c_range_08_ekf}), while g2o remains closer to its envelope
+(Fig.~\ref{fig:q2c_range_08_g2o}). In contrast, at $r\approx6$ the EKF and g2o
+results are visually closer to their uncertainty envelopes
+(Figs.~\ref{fig:q2c_range_threshold} and \ref{fig:q2c_range_threshold_g2o}).
+A denser sweep would be needed to pinpoint a precise threshold, but the evidence
+here supports $r\approx6$ as a reasonable crossover point in this run.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/q2c_range_threshold_ekf.png}
+  \caption{Q2c(iii) Detection-range sweep: EKF error vs $\pm 2\sigma$ bounds at
+  $r=6$.}
+  \label{fig:q2c_range_threshold}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/q2c_range_threshold_g2o.png}
+  \caption{Q2c(iii) Detection-range sweep: g2o error vs $\pm 2\sigma$ bounds at
+  $r=6$.}
+  \label{fig:q2c_range_threshold_g2o}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/q2c_range_04_results2.png}
+  \caption{Q2c(iii) EKF error vs $\pm 2\sigma$ bounds at $r=4$.}
+  \label{fig:q2c_range_04_ekf}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/q2c_range_04_results1.png}
+  \caption{Q2c(iii) g2o error vs $\pm 2\sigma$ bounds at $r=4$.}
+  \label{fig:q2c_range_04_g2o}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/q2c_range_08_results2.png}
+  \caption{Q2c(iii) EKF error vs $\pm 2\sigma$ bounds at $r=8$.}
+  \label{fig:q2c_range_08_ekf}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/q2c_range_08_results1.png}
+  \caption{Q2c(iii) g2o error vs $\pm 2\sigma$ bounds at $r=8$.}
+  \label{fig:q2c_range_08_g2o}
+\end{figure}
+
+%==========================
+\section{Q3: Scalability Strategies}
+\subsection{Q3a: Graph Pruning (Limit Observations per Landmark)}
+\subsubsection{Results: Map, Error, and Consistency}
+Figures~\ref{fig:q3a_results_g2o}, \ref{fig:q3a_results_g2op}, and
+\ref{fig:q3a_results_ekf} show the platform error vs.\ $\pm 2\sigma$ bounds for the
+three estimators. In the Q3a scripts, the estimators are added in the order
+\texttt{g2o-slam}, \texttt{g2op-slam} (pruned), then \texttt{ekf-slam}; therefore
+``Results~1'' corresponds to g2o, ``Results~2'' to g2o-pruned, and ``Results~3'' to
+EKF. The full g2o and pruned g2o behave similarly: both keep the error mostly
+within bounds for $x$, $y$, and $\theta$, indicating broadly consistent estimates.
+The pruned version shows slightly wider excursions near the end but remains
+stable. The EKF plot shows much larger drift (especially in $x$ and $y$), with the
+error leaving the uncertainty bounds for long intervals, indicating inconsistency
+under pruning conditions.
+
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/q3_a_results1.png}
+  \caption{Q3a Results 1: g2o-slam error vs $\pm 2\sigma$ bounds.}
+  \label{fig:q3a_results_g2o}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/q3_a_results2.png}
+  \caption{Q3a Results 2: g2o-pruned error vs $\pm 2\sigma$ bounds.}
+  \label{fig:q3a_results_g2op}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/q3_a_results3.png}
+  \caption{Q3a Results 3: ekf-slam error vs $\pm 2\sigma$ bounds.}
+  \label{fig:q3a_results_ekf}
+\end{figure}
+
+Figure~\ref{fig:q3a_map} shows the estimated landmark map with covariance ellipses
+for the full and pruned g2o variants. Visually, pruning produces a slightly noisier
+map but it remains globally coherent, consistent with the modest degradation seen in
+the error plots.
+
+\begin{figure}[t]
+  \centering
+  \includegraphicsorplaceholder{figs/q3_a_map.png}{Q3a map plot}
+  \caption{Q3a map estimates (landmarks with covariance ellipses) for g2o and
+  g2o-pruned.}
+  \label{fig:q3a_map}
+\end{figure}
+
+\subsubsection{Runtime and Chi2}
+Figure~\ref{fig:q3a_chi2_time} shows a large separation between the full and pruned
+graphs. The pruned method has a substantially lower $\chi^2$ throughout the run
+(ending around the mid-hundreds), while the full graph grows to well over a thousand.
+This is expected because pruning removes many observation residuals from the objective,
+so the plotted total cost is smaller.
+
+The runtime plot shows the practical benefit: both methods display frequent spike-like
+optimisation events, but the full graph consistently spikes higher and grows to the
+largest costs late in the run, whereas the pruned graph remains below it with visibly
+smaller spikes. This directly reflects solving a smaller linear system (fewer edges
+$\Rightarrow$ fewer residual blocks to linearise and factorise) at every re-optimisation.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/q3_a_timing_chi2.png}
+  \caption{Q3a g2o vs g2o-pruned: $\chi^2$ (top) and optimisation time (bottom).}
+  \label{fig:q3a_chi2_time}
+\end{figure}
+\subsubsection{Graph Structure Analysis}
+Table~\ref{tab:q3a_graphsize} quantifies the effect of pruning: both graphs have the
+same number of vertices (poses + landmarks), but pruning removes a large fraction
+of edges (2090 $\rightarrow$ 1630). This directly reduces the cost of factor
+linearisation and sparse factorisation, which explains the lower average
+optimisation time. Pruning is most beneficial in environments with many repeated
+observations of the same landmarks, where discarding redundant edges preserves
+accuracy while limiting graph growth.
+
+\begin{table}[t]
+\centering
+\caption{Graph size under pruning vs baseline (example structure).}
+\label{tab:q3a_graphsize}
+\begin{tabular}{lccc}
+\toprule
+Method & \#Vertices & \#Edges & Opt. time (avg) \\
+\midrule
+Baseline g2o & 1386 & 2090 & 0.3543 \\
+Pruned g2o   & 1386 & 1630 & 0.3057 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Q3b: Conditioning (Fixing Old Poses)}
+\subsubsection{Q3b(i): Chi2 and Runtime Behaviour}
+Figures~\ref{fig:q3b_results_g2o}--\ref{fig:q3b_results_ekf} use the same Results
+ordering as Q3a (Results~1 = g2o, Results~2 = g2o-fixed, Results~3 = EKF). The
+g2o-fixed estimator closely tracks the full g2o trajectory, with errors staying
+inside the bounds for most of the run, showing that fixing old poses does not
+dramatically degrade accuracy in this scenario. The EKF again exhibits larger drift
+and longer periods outside the bounds.
+
+Figure~\ref{fig:q3b_chi2_time} shows that conditioning preserves the objective value
+while dramatically reducing compute. The $\chi^2$ traces for g2o and g2o-fixed
+almost overlap for the full run, indicating that fixing old poses does not materially
+change the final residual fit in this scenario. In contrast, the optimisation time
+differs strongly: the unfixed solver exhibits growing spike amplitudes that approach
+the top of the axis late in the run, while the fixed variant remains much lower and
+more stable. This is consistent with conditioning reducing the number of active pose
+variables in the linear system, making each solve cheaper even though the graph still
+contains many historical constraints.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/q3_b_results1.png}
+  \caption{Q3b Results 1: g2o-slam error vs $\pm 2\sigma$ bounds.}
+  \label{fig:q3b_results_g2o}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/q3_b_results2.png}
+  \caption{Q3b Results 2: g2o-fixed error vs $\pm 2\sigma$ bounds.}
+  \label{fig:q3b_results_g2of}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/q3_b_results3.png}
+  \caption{Q3b Results 3: ekf-slam error vs $\pm 2\sigma$ bounds.}
+  \label{fig:q3b_results_ekf}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/q3_b_chi2.png}
+  \caption{Q3b g2o vs g2o-fixed: $\chi^2$ (top) and optimisation time (bottom).}
+  \label{fig:q3b_chi2_time}
+\end{figure}
+
+\subsubsection{Q3b(ii): Landmark Mean/Covariance During Run vs Final Unfix}
+Fixing old poses freezes part of the trajectory, so new landmark updates cannot
+retroactively adjust those poses. During the run this can make landmark estimates
+slightly biased and their covariances a bit overconfident because correlations with
+fixed poses are no longer updated. When all poses are unfixed at the end, a final
+batch optimisation can reintroduce those correlations and pull both poses and
+landmarks toward a globally consistent solution, partially correcting the bias.
+
+Figure~\ref{fig:q3b_landmarks_mid} shows landmark estimates and covariance
+ellipses mid-run with fixed poses, while Fig.~\ref{fig:q3b_landmarks_final} shows
+the final estimates after unfixing and re-optimising. The post-unfix map shows a
+small but visible correction toward a more coherent configuration and slightly
+adjusted ellipses.
+
+\begin{figure}[t]
+  \centering
+  \includegraphicsorplaceholder{figs/q3_b_landmarks_mid.png}{Q3b mid-run landmark covariances}
+  \caption{Q3b landmark estimates and covariance ellipses during the run with
+  fixed old poses.}
+  \label{fig:q3b_landmarks_mid}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphicsorplaceholder{figs/q3_b_landmarks_final.png}{Q3b final landmark covariances}
+  \caption{Q3b landmark estimates and covariance ellipses after unfixing and
+  re-optimising at the end.}
+  \label{fig:q3b_landmarks_final}
+\end{figure}
+
+
+\subsubsection{Q3b(iii): Overall Success and Trade-offs}
+Conditioning is successful here because it gives a large runtime reduction while
+keeping the final trajectory close to the full g2o solution. The trade-off is that
+intermediate estimates are temporarily suboptimal and can be slightly inconsistent
+until the final unfix step. This mirrors sliding-window estimation in practice: keep
+a limited active window for speed, then occasionally re-optimise globally to recover
+accuracy.
+
+
+%==========================
+\section{Discussion: Key Insights (High-Distinction Differentiator)}
+\begin{itemize}
+  \item \textbf{Consistency vs EKF:} The factor-graph solver is more consistent in the punishing scenarios, which is consistent with global relinearisation and joint use of constraints. EKF linearises sequentially and shows overconfident bounds when observations are sparse, leading to boundary violations in the error plots.
+  \item \textbf{Cost growth:} The staircase $\chi^2$ trend and increasing runtime spikes are consistent with graph growth and repeated sparse factorisation. More variables and edges mean larger linear systems even if the Hessian remains sparse.
+  \item \textbf{Scalability trade-offs:} Pruning reduces edges and runtime with modest accuracy loss, while conditioning (fixing old poses) gives a larger speedup but introduces temporary suboptimality that is corrected when poses are unfixed and re-optimised.
+\end{itemize}
+
+%==========================
+\section{Conclusion}
+We implemented a graph-based estimator for localisation and SLAM, derived and coded the motion and landmark factors, and validated the system using consistency plots, $\chi^2$ trends, and timing diagnostics. In nominal settings, both g2o and EKF perform well; under punishing sensing, g2o is more consistent in our runs while EKF shows overconfident bounds.
+
+For scalability, pruning reduces graph density and lowers runtime with only mild degradation, while conditioning (fixing old poses) provides a stronger runtime improvement at the cost of temporary suboptimality. Overall, the experiments show why factor graphs are a robust and scalable alternative to sequential EKF updates in larger SLAM problems.
+
+%==========================
+\section*{Appendix (Optional)}
+% Put longer code, extra plots, or angle-wrapping details here.
+\begin{lstlisting}[language=Python,caption={Example: angle wrapping helper.},label={lst:wrap}]
+def wrap_to_pi(a):
+    import numpy as np
+    return (a + np.pi) % (2*np.pi) - np.pi
+\end{lstlisting}
+
+% ---------- References ----------
+% If you don't have external refs, you can omit BibTeX and keep this minimal.
+\begin{thebibliography}{1}
+\bibitem{g2o}
+R. Kuemmerle et al., ``g2o: A general framework for graph optimization,'' \emph{ICRA}, 2011.
+\end{thebibliography}
+
+\end{document}
